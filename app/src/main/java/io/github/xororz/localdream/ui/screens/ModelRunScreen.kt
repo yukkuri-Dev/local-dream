@@ -9,6 +9,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.BitmapRegionDecoder
 import android.graphics.Canvas
 import android.net.Uri
 import android.os.Build
@@ -84,8 +85,6 @@ import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Error
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.Info
-import androidx.compose.material.icons.filled.KeyboardArrowDown
-import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Report
 import androidx.compose.material.icons.filled.Save
@@ -206,6 +205,7 @@ import java.util.Base64
 import java.util.concurrent.TimeUnit
 import kotlin.math.roundToInt
 import android.graphics.Rect as AndroidRect
+import androidx.core.graphics.createBitmap
 import androidx.core.graphics.scale
 import androidx.core.content.edit
 
@@ -308,6 +308,67 @@ private suspend fun checkBackendHealth(
             onUnhealthy()
         }
     }
+}
+
+/**
+ * For SDXL with a non-1:1 aspectRatio, returns the centered (target_w, target_h)
+ * region inside the 1024x1024 generation canvas. The longest side is forced to
+ * canvasMax (1024), the shortest side is scaled by the ratio and aligned down to
+ * a multiple of 8. Returns null in all other cases (non-SDXL, 1:1, malformed),
+ * meaning "no padding, use canvas size directly."
+ */
+fun computeAspectTargetSize(
+    isSdxl: Boolean,
+    aspectRatio: String,
+    canvasMax: Int = 1024
+): Pair<Int, Int>? {
+    if (!isSdxl) return null
+    val parts = aspectRatio.split(":")
+    if (parts.size != 2) return null
+    val rw = parts[0].toIntOrNull() ?: return null
+    val rh = parts[1].toIntOrNull() ?: return null
+    if (rw <= 0 || rh <= 0 || rw == rh) return null
+    return if (rw >= rh) {
+        val th = ((canvasMax.toDouble() * rh / rw).toInt() / 8 * 8).coerceAtLeast(8)
+        Pair(canvasMax, th)
+    } else {
+        val tw = ((canvasMax.toDouble() * rw / rh).toInt() / 8 * 8).coerceAtLeast(8)
+        Pair(tw, canvasMax)
+    }
+}
+
+/**
+ * GCD-reduces (width, height) into a "W:H" aspect-ratio string.
+ * Used by reproduce/import paths to recover an aspect from a recorded result size.
+ */
+fun inferAspectRatioString(width: Int, height: Int): String {
+    if (width <= 0 || height <= 0) return "1:1"
+    var a = width
+    var b = height
+    while (b != 0) {
+        val t = b; b = a % b; a = t
+    }
+    return "${width / a}:${height / a}"
+}
+
+/**
+ * Pads `src` (already at targetW x targetH) into a canvas of size canvasW x canvasH
+ * with a centered placement and black borders. If src already matches canvas size,
+ * returns the source unchanged.
+ */
+fun padBitmapToCanvas(
+    src: Bitmap,
+    canvasW: Int,
+    canvasH: Int
+): Bitmap {
+    if (src.width == canvasW && src.height == canvasH) return src
+    val out = createBitmap(canvasW, canvasH)
+    val canvas = Canvas(out)
+    canvas.drawColor(android.graphics.Color.BLACK)
+    val left = ((canvasW - src.width) / 2).toFloat()
+    val top = ((canvasH - src.height) / 2).toFloat()
+    canvas.drawBitmap(src, left, top, null)
+    return out
 }
 
 @Immutable
@@ -438,6 +499,8 @@ fun ModelRunScreen(
     var useOpenCL by remember { mutableStateOf(false) }
     var batchCounts by remember { mutableStateOf(1) }
     var scheduler by remember { mutableStateOf("dpm") }
+    var aspectRatio by remember { mutableStateOf("1:1") }
+    var showCustomAspectRatioDialog by remember { mutableStateOf(false) }
     var currentBatchIndex by remember { mutableStateOf(0) }
     var selectedImageUri by remember { mutableStateOf<Uri?>(null) }
     var base64EncodeDone by remember { mutableStateOf(false) }
@@ -538,6 +601,27 @@ fun ModelRunScreen(
     val upscalerPreferences =
         remember { context.getSharedPreferences("upscaler_prefs", Context.MODE_PRIVATE) }
 
+    // (effectiveWidth, effectiveHeight) is the size of the visible result.
+    // For SDXL with non-1:1 aspect_ratio it equals the centered target_w/target_h
+    // inside the 1024x1024 generation canvas; otherwise it equals the canvas itself.
+    val effectiveSize = remember(model?.isSdxl, aspectRatio, currentWidth, currentHeight) {
+        computeAspectTargetSize(model?.isSdxl == true, aspectRatio)
+            ?: Pair(currentWidth, currentHeight)
+    }
+    val effectiveWidth = effectiveSize.first
+    val effectiveHeight = effectiveSize.second
+
+    fun clearImg2imgState() {
+        selectedImageUri = null
+        croppedBitmap = null
+        maskBitmap = null
+        isInpaintMode = false
+        cropRect = null
+        savedPathHistory = null
+        base64EncodeDone = false
+        hasOriginalImageForStitch = false
+    }
+
     fun saveAllFields() {
         saveAllJob?.cancel()
         saveAllJob = scope.launch(Dispatchers.IO) {
@@ -554,7 +638,8 @@ fun ModelRunScreen(
                 denoiseStrength = denoiseStrength,
                 useOpenCL = useOpenCL,
                 batchCounts = batchCounts,
-                scheduler = scheduler
+                scheduler = scheduler,
+                aspectRatio = aspectRatio
             )
         }
     }
@@ -734,17 +819,96 @@ fun ModelRunScreen(
 
     fun handleCropComplete(base64String: String, bitmap: Bitmap, rect: AndroidRect) {
         showCropScreen = false
-        selectedImageUri = imageUriForCrop
+        val sourceUri = imageUriForCrop
+        selectedImageUri = sourceUri
         imageUriForCrop = null
-        croppedBitmap = bitmap
-        cropRect = rect
         hasOriginalImageForStitch = true
 
+        // CropImageScreen returns the cropped bitmap via cropify, whose output
+        // can carry a sub-pixel offset relative to the cropRect we computed
+        // from frameRect / imageRect. That's invisible when the patch is later
+        // pasted back as a whole (SD1.5 / SDXL 1:1), but in SDXL aspect-pad
+        // mode the patch goes through scale → pad → backend center-crop →
+        // scale-back, and the per-step rounding leaks the offset as a
+        // few-pixel stitch misalignment.
+        //
+        // Fix: re-crop directly from the original image using BitmapRegionDecoder
+        // so the bitmap content is *strictly* the cropRect region in the
+        // original's coordinate space. cropRect is also clamped to the original
+        // bounds, and the clamped value is saved so stitch later paints to the
+        // exact same pixel range we cropped from.
         scope.launch(Dispatchers.IO) {
             try {
                 base64EncodeDone = false
+                val aspectTarget =
+                    computeAspectTargetSize(model?.isSdxl == true, aspectRatio)
+                val targetW = aspectTarget?.first ?: currentWidth
+                val targetH = aspectTarget?.second ?: currentHeight
+
+                var clampedRect = rect
+                val freshCropped: Bitmap? = try {
+                    sourceUri?.let { uri ->
+                        context.contentResolver.openInputStream(uri)?.use { input ->
+                            @Suppress("DEPRECATION")
+                            val decoder = BitmapRegionDecoder.newInstance(input, false)
+                                ?: throw IllegalStateException(
+                                    "BitmapRegionDecoder.newInstance returned null"
+                                )
+                            try {
+                                val safeLeft = rect.left.coerceAtLeast(0)
+                                val safeTop = rect.top.coerceAtLeast(0)
+                                val safeRight = rect.right.coerceAtMost(decoder.width)
+                                val safeBottom = rect.bottom.coerceAtMost(decoder.height)
+                                if (safeRight > safeLeft && safeBottom > safeTop) {
+                                    val region = AndroidRect(
+                                        safeLeft, safeTop, safeRight, safeBottom
+                                    )
+                                    clampedRect = region
+                                    decoder.decodeRegion(region, BitmapFactory.Options())
+                                } else null
+                            } finally {
+                                decoder.recycle()
+                            }
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.w(
+                        "ModelRunScreen",
+                        "BitmapRegionDecoder failed, fall back to cropify bitmap: ${e.message}"
+                    )
+                    null
+                }
+
+                val sourceBitmap = freshCropped ?: bitmap
+
+                val scaled = withContext(Dispatchers.Default) {
+                    if (sourceBitmap.width != targetW || sourceBitmap.height != targetH) {
+                        sourceBitmap.scale(targetW, targetH)
+                    } else {
+                        sourceBitmap
+                    }
+                }
+
+                val needsPad =
+                    scaled.width != currentWidth || scaled.height != currentHeight
+                val payload = if (needsPad) {
+                    val padded = padBitmapToCanvas(scaled, currentWidth, currentHeight)
+                    val baos = ByteArrayOutputStream()
+                    padded.compress(Bitmap.CompressFormat.PNG, 90, baos)
+                    Base64.getEncoder().encodeToString(baos.toByteArray())
+                } else {
+                    val baos = ByteArrayOutputStream()
+                    scaled.compress(Bitmap.CompressFormat.PNG, 90, baos)
+                    Base64.getEncoder().encodeToString(baos.toByteArray())
+                }
+
+                withContext(Dispatchers.Main) {
+                    cropRect = clampedRect
+                    croppedBitmap = scaled
+                }
+
                 val tmpFile = File(context.filesDir, "tmp.txt")
-                tmpFile.writeText(base64String)
+                tmpFile.writeText(payload)
                 base64EncodeDone = true
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
@@ -770,8 +934,21 @@ fun ModelRunScreen(
 
         scope.launch(Dispatchers.IO) {
             try {
+                // The mask comes back at target size (matching the cropped image fed
+                // into InpaintScreen). For SDXL aspect-pad mode we re-encode after
+                // padding to currentWidth x currentHeight so it lines up with the
+                // padded image upload.
+                val needsPad = maskBmp.width != currentWidth || maskBmp.height != currentHeight
+                val payload = if (needsPad) {
+                    val padded = padBitmapToCanvas(maskBmp, currentWidth, currentHeight)
+                    val baos = ByteArrayOutputStream()
+                    padded.compress(Bitmap.CompressFormat.PNG, 90, baos)
+                    Base64.getEncoder().encodeToString(baos.toByteArray())
+                } else {
+                    maskBase64
+                }
                 val maskFile = File(context.filesDir, "mask.txt")
-                maskFile.writeText(maskBase64)
+                maskFile.writeText(payload)
 
                 withContext(Dispatchers.Main) {
                     base64EncodeDone = true
@@ -791,17 +968,47 @@ fun ModelRunScreen(
         scope.launch {
             val ready = try {
                 base64EncodeDone = false
+                val aspectTarget = computeAspectTargetSize(model?.isSdxl == true, aspectRatio)
+                val targetW = aspectTarget?.first ?: currentWidth
+                val targetH = aspectTarget?.second ?: currentHeight
+
+                // 1) Center-crop+scale the source to (targetW, targetH).
+                // 2) If aspect padding is in effect, pad up to (currentWidth, currentHeight).
                 val resized = withContext(Dispatchers.Default) {
-                    if (bitmap.width != currentWidth || bitmap.height != currentHeight) {
-                        bitmap.scale(currentWidth, currentHeight)
+                    val srcRatio = bitmap.width.toFloat() / bitmap.height.toFloat()
+                    val dstRatio = targetW.toFloat() / targetH.toFloat()
+                    val centerCropped = if (kotlin.math.abs(srcRatio - dstRatio) < 1e-3f) {
+                        bitmap
                     } else {
-                        bitmap.copy(Bitmap.Config.ARGB_8888, false)
+                        val (cropW, cropH) = if (srcRatio > dstRatio) {
+                            Pair((bitmap.height * dstRatio).toInt(), bitmap.height)
+                        } else {
+                            Pair(bitmap.width, (bitmap.width / dstRatio).toInt())
+                        }
+                        val cx = (bitmap.width - cropW) / 2
+                        val cy = (bitmap.height - cropH) / 2
+                        Bitmap.createBitmap(bitmap, cx, cy, cropW, cropH)
                     }
+                    val scaled =
+                        if (centerCropped.width != targetW || centerCropped.height != targetH) {
+                            centerCropped.scale(targetW, targetH)
+                        } else {
+                            centerCropped.copy(Bitmap.Config.ARGB_8888, false)
+                        }
+                    scaled
                 }
+
+                val displayBitmap = resized
+                val uploadBitmap =
+                    if (resized.width != currentWidth || resized.height != currentHeight) {
+                        padBitmapToCanvas(resized, currentWidth, currentHeight)
+                    } else {
+                        resized
+                    }
 
                 val base64String = withContext(Dispatchers.IO) {
                     val baos = ByteArrayOutputStream()
-                    resized.compress(Bitmap.CompressFormat.PNG, 90, baos)
+                    uploadBitmap.compress(Bitmap.CompressFormat.PNG, 90, baos)
                     Base64.getEncoder().encodeToString(baos.toByteArray())
                 }
 
@@ -809,8 +1016,8 @@ fun ModelRunScreen(
                     File(context.filesDir, "tmp.txt").writeText(base64String)
                 }
 
-                croppedBitmap = resized
-                cropRect = AndroidRect(0, 0, resized.width, resized.height)
+                croppedBitmap = displayBitmap
+                cropRect = AndroidRect(0, 0, displayBitmap.width, displayBitmap.height)
                 selectedImageUri = Uri.fromFile(File(context.filesDir, "tmp.txt"))
                 hasOriginalImageForStitch = false
                 base64EncodeDone = true
@@ -934,21 +1141,17 @@ fun ModelRunScreen(
         coroutineScope.launch {
             if (shouldStitch) {
                 withContext(Dispatchers.IO) {
-                    var originalBitmap: Bitmap? = null
-                    var mutableOriginal: Bitmap? = null
-                    var resizedPatch: Bitmap? = null
                     try {
-                        originalBitmap =
+                        val originalBitmap =
                             context.contentResolver.openInputStream(snapshotSelectedImageUri!!)!!
-                                .use {
-                                    BitmapFactory.decodeStream(it)
-                                }
+                                .use { BitmapFactory.decodeStream(it) }
 
-                        mutableOriginal = originalBitmap.copy(Bitmap.Config.ARGB_8888, true)
+                        val mutableOriginal =
+                            originalBitmap.copy(Bitmap.Config.ARGB_8888, true)
 
-                        val patch = bitmap
-                        resizedPatch =
-                            patch.scale(snapshotCropRect!!.width(), snapshotCropRect!!.height())
+                        val rectW = snapshotCropRect!!.width()
+                        val rectH = snapshotCropRect!!.height()
+                        val resizedPatch = bitmap.scale(rectW, rectH)
 
                         val canvas = Canvas(mutableOriginal)
                         canvas.drawBitmap(
@@ -1068,6 +1271,7 @@ fun ModelRunScreen(
             useOpenCL = prefs.useOpenCL
             batchCounts = prefs.batchCounts
             scheduler = prefs.scheduler
+            aspectRatio = prefs.aspectRatio
 
             currentWidth =
                 if (model?.isSdxl == true) 1024
@@ -1164,8 +1368,8 @@ fun ModelRunScreen(
                         prompt = generationParamsTmp.prompt,
                         negativePrompt = generationParamsTmp.negativePrompt,
                         generationTime = genTime,
-                        width = if (model?.runOnCpu == true) generationParamsTmp.width else currentWidth,
-                        height = if (model?.runOnCpu == true) generationParamsTmp.height else currentHeight,
+                        width = if (model?.runOnCpu == true) generationParamsTmp.width else state.bitmap.width,
+                        height = if (model?.runOnCpu == true) generationParamsTmp.height else state.bitmap.height,
                         runOnCpu = model?.runOnCpu ?: false,
                         denoiseStrength = generationParamsTmp.denoiseStrength,
                         useOpenCL = generationParamsTmp.useOpenCL,
@@ -1293,6 +1497,85 @@ fun ModelRunScreen(
         )
     }
 
+    if (showCustomAspectRatioDialog) {
+        var ratioWStr by remember { mutableStateOf("") }
+        var ratioHStr by remember { mutableStateOf("") }
+        var ratioError by remember { mutableStateOf(false) }
+        AlertDialog(
+            onDismissRequest = { showCustomAspectRatioDialog = false },
+            title = { Text(stringResource(R.string.aspect_ratio_custom_title)) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        stringResource(R.string.aspect_ratio_custom_hint),
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        OutlinedTextField(
+                            value = ratioWStr,
+                            onValueChange = {
+                                ratioWStr = it.filter { c -> c.isDigit() }.take(5); ratioError =
+                                false
+                            },
+                            label = { Text("W") },
+                            singleLine = true,
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                            modifier = Modifier.weight(1f),
+                            shape = MaterialTheme.shapes.medium,
+                            isError = ratioError
+                        )
+                        Text(":", style = MaterialTheme.typography.titleLarge)
+                        OutlinedTextField(
+                            value = ratioHStr,
+                            onValueChange = {
+                                ratioHStr = it.filter { c -> c.isDigit() }.take(5); ratioError =
+                                false
+                            },
+                            label = { Text("H") },
+                            singleLine = true,
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                            modifier = Modifier.weight(1f),
+                            shape = MaterialTheme.shapes.medium,
+                            isError = ratioError
+                        )
+                    }
+                    if (ratioError) {
+                        Text(
+                            stringResource(R.string.aspect_ratio_invalid),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.error
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val w = ratioWStr.toIntOrNull()
+                    val h = ratioHStr.toIntOrNull()
+                    if (w != null && h != null && w > 0 && h > 0) {
+                        val newRatio = "$w:$h"
+                        if (newRatio != aspectRatio) {
+                            aspectRatio = newRatio
+                            clearImg2imgState()
+                            saveAllFields()
+                        }
+                        showCustomAspectRatioDialog = false
+                    } else {
+                        ratioError = true
+                    }
+                }) { Text(stringResource(R.string.confirm)) }
+            },
+            dismissButton = {
+                TextButton(onClick = { showCustomAspectRatioDialog = false }) {
+                    Text(stringResource(R.string.cancel))
+                }
+            }
+        )
+    }
+
     if (showResolutionChangeDialog && pendingResolution != null) {
         AlertDialog(
             onDismissRequest = {
@@ -1379,6 +1662,7 @@ fun ModelRunScreen(
                         seed = ""
                         batchCounts = 1
                         scheduler = "dpm"
+                        aspectRatio = "1:1"
                         prompt = model?.defaultPrompt ?: ""
                         negativePrompt = model?.defaultNegativePrompt ?: ""
                         promptFieldValue = TextFieldValue(prompt, TextRange(prompt.length))
@@ -1400,7 +1684,8 @@ fun ModelRunScreen(
                                 denoiseStrength = 0.6f,
                                 useOpenCL = useOpenCL,
                                 batchCounts = 1,
-                                scheduler = "dpm"
+                                scheduler = "dpm",
+                                aspectRatio = "1:1"
                             )
                         }
                         showResetConfirmDialog = false
@@ -1599,6 +1884,55 @@ fun ModelRunScreen(
                                                 .verticalScroll(rememberScrollState())
                                                 .padding(vertical = 4.dp)
                                         ) {
+                                            if (model?.isSdxl == true) {
+                                                Column(modifier = Modifier.fillMaxWidth()) {
+                                                    Text(
+                                                        stringResource(R.string.aspect_ratio),
+                                                        style = MaterialTheme.typography.bodyMedium
+                                                    )
+                                                    val presets = listOf("1:1", "3:4", "4:3")
+                                                    val isCustom = aspectRatio !in presets
+                                                    Row(
+                                                        modifier = Modifier
+                                                            .fillMaxWidth()
+                                                            .horizontalScroll(rememberScrollState()),
+                                                        horizontalArrangement = Arrangement.spacedBy(
+                                                            8.dp
+                                                        )
+                                                    ) {
+                                                        presets.forEach { ratio ->
+                                                            FilterChip(
+                                                                selected = aspectRatio == ratio,
+                                                                onClick = {
+                                                                    if (!isRunning && aspectRatio != ratio) {
+                                                                        aspectRatio = ratio
+                                                                        clearImg2imgState()
+                                                                        saveAllFields()
+                                                                    }
+                                                                },
+                                                                label = { Text(ratio) },
+                                                                enabled = !isRunning
+                                                            )
+                                                        }
+                                                        FilterChip(
+                                                            selected = isCustom,
+                                                            onClick = {
+                                                                if (!isRunning) {
+                                                                    showCustomAspectRatioDialog =
+                                                                        true
+                                                                }
+                                                            },
+                                                            label = {
+                                                                Text(
+                                                                    if (isCustom) aspectRatio
+                                                                    else stringResource(R.string.aspect_ratio_custom)
+                                                                )
+                                                            },
+                                                            enabled = !isRunning
+                                                        )
+                                                    }
+                                                }
+                                            }
                                             if (model?.runOnCpu == false && model.isSdxl == false && availableResolutions.isNotEmpty()) {
                                                 Column(
                                                     modifier = Modifier.fillMaxWidth(),
@@ -2052,12 +2386,19 @@ fun ModelRunScreen(
                                                 ?.let { putExtra("seed", it) }
                                             putExtra("width", currentWidth)
                                             putExtra("height", currentHeight)
+                                            // Backend now crops progress previews to the
+                                            // visible target rectangle, so the service must
+                                            // decode each preview with the effective dims
+                                            // (target_w/h), not the 1024 canvas size.
+                                            putExtra("effective_width", effectiveWidth)
+                                            putExtra("effective_height", effectiveHeight)
                                             putExtra(
                                                 "denoise_strength",
                                                 denoiseStrength
                                             )
                                             putExtra("use_opencl", useOpenCL)
                                             putExtra("scheduler", scheduler)
+                                            putExtra("aspect_ratio", aspectRatio)
                                             putExtra("batch_index", i)
                                             if (selectedImageUri != null && base64EncodeDone) {
                                                 putExtra("has_image", true)
@@ -2234,12 +2575,13 @@ fun ModelRunScreen(
                                 shape = MaterialTheme.shapes.small,
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .aspectRatio(currentWidth.toFloat() / currentHeight.toFloat())
+                                    .aspectRatio(1f)
                             ) {
                                 Image(
                                     bitmap = bitmap.asImageBitmap(),
                                     contentDescription = "Generation Preview",
-                                    modifier = Modifier.fillMaxSize()
+                                    modifier = Modifier.fillMaxSize(),
+                                    contentScale = androidx.compose.ui.layout.ContentScale.Fit
                                 )
                             }
                         }
@@ -3398,10 +3740,13 @@ fun ModelRunScreen(
             }
         }
         if (showCropScreen && imageUriForCrop != null) {
+            val aspectTarget = computeAspectTargetSize(model?.isSdxl == true, aspectRatio)
+            val cropW = aspectTarget?.first ?: currentWidth
+            val cropH = aspectTarget?.second ?: currentHeight
             CropImageScreen(
                 imageUri = imageUriForCrop!!,
-                width = currentWidth,
-                height = currentHeight,
+                width = cropW,
+                height = cropH,
                 onCropComplete = { base64String, bitmap, rect ->
                     handleCropComplete(base64String, bitmap, rect)
                 },
@@ -4199,6 +4544,13 @@ fun ModelRunScreen(
                         steps = params.steps.toFloat()
                         seed = params.seed?.toString() ?: ""
                         scheduler = params.scheduler
+                        if (model?.isSdxl == true) {
+                            val newRatio = inferAspectRatioString(params.width, params.height)
+                            if (newRatio != aspectRatio) {
+                                aspectRatio = newRatio
+                                clearImg2imgState()
+                            }
+                        }
                         saveAllFields()
 
                         // Close dialogs and switch to prompt page
@@ -4229,6 +4581,13 @@ fun ModelRunScreen(
                         steps = params.steps.toFloat()
                         seed = ""  // Don't copy seed
                         scheduler = params.scheduler
+                        if (model?.isSdxl == true) {
+                            val newRatio = inferAspectRatioString(params.width, params.height)
+                            if (newRatio != aspectRatio) {
+                                aspectRatio = newRatio
+                                clearImg2imgState()
+                            }
+                        }
                         saveAllFields()
 
                         // Close dialogs and switch to prompt page

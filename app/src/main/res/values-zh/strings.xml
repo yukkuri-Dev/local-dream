@@ -277,6 +277,11 @@
     <string name="switch_resolution">切换分辨率</string>
     <string name="switch_resolution_hint">切换分辨率将重启后端服务，当前生成会被中断。是否继续？</string>
     <string name="resolution">分辨率</string>
+    <string name="aspect_ratio">图像宽高比</string>
+    <string name="aspect_ratio_custom">自定义</string>
+    <string name="aspect_ratio_custom_title">自定义宽高比</string>
+    <string name="aspect_ratio_custom_hint">输入两个正整数（如 21 9）</string>
+    <string name="aspect_ratio_invalid">无效的比例，必须为两个正整数。</string>
     <string name="scheduler">调度器</string>
     <string name="extracting">解压中…</string>
 

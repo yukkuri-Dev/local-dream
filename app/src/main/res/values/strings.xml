@@ -277,6 +277,11 @@
     <string name="switch_resolution">Switch Resolution</string>
     <string name="switch_resolution_hint">Switching resolution will restart the backend service and interrupt current generation. Continue?</string>
     <string name="resolution">Resolution</string>
+    <string name="aspect_ratio">Aspect Ratio</string>
+    <string name="aspect_ratio_custom">Custom</string>
+    <string name="aspect_ratio_custom_title">Custom Aspect Ratio</string>
+    <string name="aspect_ratio_custom_hint">Enter two positive integers (e.g. 21 9)</string>
+    <string name="aspect_ratio_invalid">Invalid ratio. Must be two positive integers.</string>
     <string name="scheduler">Scheduler</string>
     <string name="extracting">Extracting…</string>
 
