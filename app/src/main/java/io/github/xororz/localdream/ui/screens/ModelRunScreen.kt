@@ -1192,6 +1192,7 @@ fun ModelRunScreen(
             progress = 0f
             errorMessage = null
             currentBatchIndex = 0
+            generationStartTime = null
             BackgroundGenerationService.resetState()
             coroutineScope.launch {
                 pagerState.scrollToPage(0)
@@ -1322,7 +1323,7 @@ fun ModelRunScreen(
     LaunchedEffect(serviceState) {
         when (val state = serviceState) {
             is GenerationState.Progress -> {
-                if (progress == 0f) {
+                if (generationStartTime == null) {
                     generationStartTime = System.currentTimeMillis()
                 }
                 progress = state.progress
@@ -1431,6 +1432,7 @@ fun ModelRunScreen(
                 errorMessage = state.message
                 isRunning = false
                 progress = 0f
+                generationStartTime = null
             }
 
             else -> {
