@@ -3673,7 +3673,16 @@ int main(int argc, char **argv) {
       res.set_content(err.dump(), "application/json");
     }
   });
-
+  svr.Post("/about", [](const httplib::Request &, httplib::Response &res) {
+    nlohmann::json about = {
+        {"app", "local dream (This is a test version with the backend modified from MNN to LiteRT.)"},
+        {"description",
+         "A high-performance image generation server using QNN and MNN."},
+        {"github", "https://github.com/yukkuri-Dev/local-dream"}
+    };
+    res.set_content(about.dump(), "application/json");
+    res.set_header("Access-Control-Allow-Origin", "*");
+  });
   // Binary protocol upscale endpoint - optimized for performance
   svr.Post("/upscale", [&](const httplib::Request &req,
                            httplib::Response &res) {
