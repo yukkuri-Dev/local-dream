@@ -1,3 +1,8 @@
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -22,6 +27,7 @@
 #include "SDUtils.hpp"
 #include "SafeTensor2MNN.hpp"
 #include "Scheduler.hpp"
+#include "Sha256.hpp"
 
 // QNN Headers
 #include "BuildId.hpp"
@@ -56,15 +62,82 @@
 
 #include "zstd.h"
 
-//liteRT
-#include <litert/c/litert_environment.h>
-#include <litert/c/litert_compiled_model.h>
-#include <litert/c/litert_common.h>
+// FP16 token-embedding lookup table. Either owns a converted vector (when the
+// on-disk data was FP32 and had to be narrowed) or maps the on-disk FP16 file
+// read-only. Lookups are sparse (only the prompt's token rows), so the mmap
+// path keeps the large table out of resident anonymous memory: untouched rows
+// never fault in, and the pages that do are clean and reclaimable.
+class TokenEmbTable {
+ public:
+  TokenEmbTable() = default;
+  ~TokenEmbTable() { reset(); }
+  TokenEmbTable(const TokenEmbTable &) = delete;
+  TokenEmbTable &operator=(const TokenEmbTable &) = delete;
 
-#include <android/log.h>
-#define TAG "LiteRTCheck"
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
+  bool empty() const { return data_ == nullptr; }
+  uint16_t operator[](size_t i) const { return data_[i]; }
 
+  void setOwned(std::vector<uint16_t> &&v) {
+    reset();
+    owned_ = std::move(v);
+    data_ = owned_.data();
+  }
+  void setMapped(void *base, size_t bytes) {
+    reset();
+    map_ = base;
+    mapBytes_ = bytes;
+    data_ = static_cast<const uint16_t *>(base);
+  }
+
+ private:
+  void reset() {
+    if (map_ != nullptr) {
+      munmap(map_, mapBytes_);
+      map_ = nullptr;
+      mapBytes_ = 0;
+    }
+    owned_ = std::vector<uint16_t>();
+    data_ = nullptr;
+  }
+  const uint16_t *data_ = nullptr;
+  std::vector<uint16_t> owned_;
+  void *map_ = nullptr;
+  size_t mapBytes_ = 0;
+};
+
+// RAII read-only whole-file memory map. For large, transient inputs (e.g. the
+// original model used as a zstd patch dictionary) this keeps the bytes as
+// reclaimable, file-backed pages instead of a large anonymous heap buffer, and
+// unmaps on every scope exit including exceptions.
+struct MmapFile {
+  const uint8_t *data = nullptr;
+  size_t size = 0;
+
+  explicit MmapFile(const std::string &path) {
+    int fd = open(path.c_str(), O_RDONLY);
+    if (fd < 0) return;
+    struct stat st{};
+    if (0 == fstat(fd, &st) && st.st_size > 0) {
+      void *m = mmap(nullptr, static_cast<size_t>(st.st_size), PROT_READ,
+                     MAP_PRIVATE, fd, 0);
+      if (m != MAP_FAILED) {
+        base_ = m;
+        size = static_cast<size_t>(st.st_size);
+        data = static_cast<const uint8_t *>(m);
+      }
+    }
+    close(fd);
+  }
+  ~MmapFile() {
+    if (base_ != nullptr) munmap(base_, size);
+  }
+  MmapFile(const MmapFile &) = delete;
+  MmapFile &operator=(const MmapFile &) = delete;
+  bool valid() const { return data != nullptr; }
+
+ private:
+  void *base_ = nullptr;
+};
 
 int port = 8081;
 std::string listen_address = "127.0.0.1";
@@ -80,9 +153,9 @@ float nsfw_threshold = 0.5f;
 std::string clipPath, clip2Path, unetPath, vaeDecoderPath, vaeEncoderPath,
     safetyCheckerPath, tokenizerPath, patchPath, modelDir, upscalerPath;
 std::vector<float> pos_emb;
-std::vector<uint16_t> token_emb;  // Stored as FP16 to save memory
+TokenEmbTable token_emb;  // FP16, mmap-backed when stored as FP16 on disk
 std::vector<float> pos_emb_2;
-std::vector<uint16_t> token_emb_2;  // SDXL encoder 2 token embeddings (FP16)
+TokenEmbTable token_emb_2;  // SDXL encoder 2 token embeddings (FP16)
 std::shared_ptr<tokenizers::Tokenizer> tokenizer;
 PromptProcessor promptProcessor;
 std::unique_ptr<QnnModel> clipApp = nullptr;
@@ -108,16 +181,27 @@ MNN::Session *safetyCheckerSession = nullptr;
 std::string prompt;
 std::string negative_prompt;
 
-// CLIP output cache: if prompt + negative_prompt are identical to the previous
-// request, reuse the cached text-encoder outputs and skip CLIP inference
-// entirely. Buffers below are kept per-pipeline so SD1.5 and SDXL are handled
-// uniformly.
-bool clip_cache_valid = false;
-std::string cached_prompt;
-std::string cached_negative_prompt;
-std::vector<float> cached_text_embedding_float;        // SD1.5 encoder output
-std::vector<float> cached_sdxl_encoder_hidden_states;  // SDXL concat hidden
-std::vector<float> cached_sdxl_text_embeds;            // SDXL pooled
+// Persistent per-prompt CLIP cache lives on disk under
+// {modelDir}/cache/prompt_<sha32>.bin. Positive and negative prompts are
+// looked up independently: a single side hit still skips half the CLIP work.
+// A prompt that uses a textual-inversion embedding is excluded (its CLIP
+// output depends on embedding state we don't want baked into a stable file).
+namespace prompt_cache {
+constexpr char kMagic[4] = {'P', 'C', 'L', 'P'};
+constexpr uint32_t kVersion = 1;
+constexpr uint32_t kModeSd15 = 0;
+constexpr uint32_t kModeSdxl = 1;
+constexpr uint32_t kSeqLen = 77;
+
+struct Header {
+  char magic[4];
+  uint32_t version;
+  uint32_t mode;
+  uint32_t seq_len;
+  uint32_t hidden_dim;
+  uint32_t pooled_dim;
+};
+}  // namespace prompt_cache
 
 int steps;
 float cfg;
@@ -175,6 +259,97 @@ bool clip_skip_2 = false;
 QnnFunctionPointers g_qnnSystemFuncs;
 std::string g_backendPathCmd;
 
+// Returns "{model_dir}/cache", creating it if needed. Returns "" when
+// model_dir is empty or directory creation fails; callers must treat that
+// as "caching disabled for this run".
+static std::string ensureCacheDir(const std::string &model_dir) {
+  if (model_dir.empty()) return "";
+  std::filesystem::path p = std::filesystem::path(model_dir) / "cache";
+  std::error_code ec;
+  std::filesystem::create_directories(p, ec);
+  if (ec) return "";
+  return p.string();
+}
+
+// True if any token of `prompt_text` resolves to a textual-inversion
+// embedding loaded by promptProcessor. Used to opt that side out of the
+// persistent prompt cache.
+static bool promptHasEmbedding(const std::string &prompt_text) {
+  auto tokens = promptProcessor.process(prompt_text);
+  for (const auto &t : tokens) {
+    if (t.is_embedding) return true;
+  }
+  return false;
+}
+
+static std::string promptCachePath(const std::string &cache_dir,
+                                   const std::string &prompt_text) {
+  if (cache_dir.empty()) return "";
+  return cache_dir + "/prompt_" + Sha256::hashHex(prompt_text, 32) + ".bin";
+}
+
+// Reads {hidden_states[, pooled]} from disk for `prompt_text`. Returns true
+// on a valid hit; the destination buffers must already be sized for the
+// expected layout. The file is silently treated as miss when missing, wrong
+// magic/version, or dimension mismatch.
+//   - hidden_dst: seq_len * hidden_dim float32
+//   - pooled_dst: pooled_dim float32 (nullptr for SD1.5)
+static bool loadPromptCache(const std::string &cache_dir,
+                            const std::string &prompt_text, uint32_t mode,
+                            uint32_t hidden_dim, uint32_t pooled_dim,
+                            float *hidden_dst, float *pooled_dst) {
+  std::string path = promptCachePath(cache_dir, prompt_text);
+  if (path.empty()) return false;
+  std::ifstream ifs(path, std::ios::binary);
+  if (!ifs) return false;
+
+  prompt_cache::Header h{};
+  ifs.read(reinterpret_cast<char *>(&h), sizeof(h));
+  if (!ifs) return false;
+  if (std::memcmp(h.magic, prompt_cache::kMagic, 4) != 0) return false;
+  if (h.version != prompt_cache::kVersion) return false;
+  if (h.mode != mode) return false;
+  if (h.seq_len != prompt_cache::kSeqLen) return false;
+  if (h.hidden_dim != hidden_dim) return false;
+  if (h.pooled_dim != pooled_dim) return false;
+
+  size_t hidden_bytes = size_t(h.seq_len) * h.hidden_dim * sizeof(float);
+  ifs.read(reinterpret_cast<char *>(hidden_dst), hidden_bytes);
+  if (!ifs) return false;
+  if (pooled_dim > 0) {
+    if (!pooled_dst) return false;
+    size_t pooled_bytes = size_t(pooled_dim) * sizeof(float);
+    ifs.read(reinterpret_cast<char *>(pooled_dst), pooled_bytes);
+    if (!ifs) return false;
+  }
+  return true;
+}
+
+static void savePromptCache(const std::string &cache_dir,
+                            const std::string &prompt_text, uint32_t mode,
+                            uint32_t hidden_dim, uint32_t pooled_dim,
+                            const float *hidden_src, const float *pooled_src) {
+  std::string path = promptCachePath(cache_dir, prompt_text);
+  if (path.empty()) return;
+  std::ofstream ofs(path, std::ios::binary | std::ios::trunc);
+  if (!ofs) return;
+
+  prompt_cache::Header h{};
+  std::memcpy(h.magic, prompt_cache::kMagic, 4);
+  h.version = prompt_cache::kVersion;
+  h.mode = mode;
+  h.seq_len = prompt_cache::kSeqLen;
+  h.hidden_dim = hidden_dim;
+  h.pooled_dim = pooled_dim;
+  ofs.write(reinterpret_cast<const char *>(&h), sizeof(h));
+  ofs.write(reinterpret_cast<const char *>(hidden_src),
+            size_t(h.seq_len) * h.hidden_dim * sizeof(float));
+  if (pooled_dim > 0 && pooled_src) {
+    ofs.write(reinterpret_cast<const char *>(pooled_src),
+              size_t(pooled_dim) * sizeof(float));
+  }
+}
+
 // Global function to create QNN models dynamically
 std::unique_ptr<QnnModel> createQnnModel(const std::string &modelPath,
                                          const std::string &modelName) {
@@ -208,6 +383,46 @@ std::unique_ptr<QnnModel> createQnnModel(const std::string &modelPath,
   return app;
 }
 
+// Load an MNN model via mmap + createFromBuffer instead of createFromFile.
+// createFromFile reads the whole .mnn in 4 KB chunks and then merges them into
+// one contiguous buffer, transiently holding ~2x the model size in anonymous
+// (non-reclaimable) memory. Mapping the file read-only keeps that source as
+// clean, file-backed pages the kernel can reclaim under pressure, so the peak
+// anonymous footprint during load drops to the single owned buffer MNN copies
+// into. createFromBuffer copies the bytes, so the mapping can be released right
+// away. Falls back to createFromFile on any mmap-path failure.
+static MNN::Interpreter *createMnnInterpreterMmap(const char *path) {
+  int fd = open(path, O_RDONLY);
+  if (fd < 0) {
+    return MNN::Interpreter::createFromFile(path);
+  }
+  struct stat st{};
+  if (0 != fstat(fd, &st) || st.st_size <= 0) {
+    close(fd);
+    return MNN::Interpreter::createFromFile(path);
+  }
+  size_t size = static_cast<size_t>(st.st_size);
+  void *mapped = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+  // The mapping holds its own file reference, so the fd can be closed now.
+  close(fd);
+  if (MAP_FAILED == mapped) {
+    return MNN::Interpreter::createFromFile(path);
+  }
+  // MNN copies the whole buffer once, sequentially; hint readahead to match.
+  madvise(mapped, size, MADV_SEQUENTIAL);
+  MNN::Interpreter *interpreter =
+      MNN::Interpreter::createFromBuffer(mapped, size);
+  munmap(mapped, size);
+  if (interpreter) {
+    // createFromFile sets a default external weight path; createFromBuffer does
+    // not. Mirror it so models that store weights in a companion ".weight" file
+    // still resolve them at session creation. Harmless when no such file
+    // exists.
+    interpreter->setExternalFile((std::string(path) + ".weight").c_str());
+  }
+  return interpreter;
+}
+
 namespace qnn {
 namespace tools {
 namespace sample_app {
@@ -228,105 +443,17 @@ std::vector<char> readFileForPatch(const std::string &filePath) {
   return buffer;
 }
 
-void writeFileForPatch(const std::string &filePath,
-                       const std::vector<char> &data) {
-  std::ofstream file(filePath, std::ios::binary);
-  if (!file.is_open()) {
-    throw std::runtime_error("Failed to open file for writing: " + filePath);
-  }
-  if (!data.empty()) {
-    if (!file.write(data.data(), data.size())) {
-      throw std::runtime_error("Failed to write file: " + filePath);
-    }
-  }
-}
-
-int applyZstdPatch(const std::string &oldFilePath,
-                   const std::string &patchFilePath,
-                   const std::string &newFilePath) {
-  try {
-    std::vector<char> oldFileBuffer = readFileForPatch(oldFilePath);
-    QNN_INFO("Read old file (%s): %zu bytes.", oldFilePath.c_str(),
-             oldFileBuffer.size());
-
-    std::vector<char> patchFileBuffer = readFileForPatch(patchFilePath);
-    QNN_INFO("Read patch file (%s): %zu bytes.", patchFilePath.c_str(),
-             patchFileBuffer.size());
-
-    if (patchFileBuffer.empty()) {
-      throw std::runtime_error("Patch file (" + patchFilePath +
-                               ") is empty or could not be read.");
-    }
-
-    unsigned long long const decompressedSize = ZSTD_getFrameContentSize(
-        patchFileBuffer.data(), patchFileBuffer.size());
-
-    if (decompressedSize == ZSTD_CONTENTSIZE_ERROR) {
-      throw std::runtime_error("Patch file (" + patchFilePath +
-                               ") is not a valid zstd frame.");
-    }
-    if (decompressedSize == ZSTD_CONTENTSIZE_UNKNOWN) {
-      throw std::runtime_error(
-          "Decompressed size is unknown. Cannot proceed with this simple "
-          "implementation.");
-    }
-
-    std::vector<char> newFileBuffer;
-    if (decompressedSize > 0) {
-      newFileBuffer.resize(decompressedSize);
-    } else {
-      writeFileForPatch(newFilePath, newFileBuffer);
-      QNN_INFO(
-          "Successfully applied patch (resulting in an empty file). New file "
-          "saved to: %s",
-          newFilePath.c_str());
-      return 0;
-    }
-
-    ZSTD_DCtx *const dctx = ZSTD_createDCtx();
-    if (dctx == nullptr) {
-      throw std::runtime_error("ZSTD_createDCtx() failed!");
-    }
-
-    size_t const actualDecompressedSize = ZSTD_decompress_usingDict(
-        dctx, newFileBuffer.data(), newFileBuffer.size(),
-        patchFileBuffer.data(), patchFileBuffer.size(), oldFileBuffer.data(),
-        oldFileBuffer.size());
-
-    ZSTD_freeDCtx(dctx);
-
-    if (ZSTD_isError(actualDecompressedSize)) {
-      throw std::runtime_error(
-          "ZSTD_decompress_usingDict() failed: " +
-          std::string(ZSTD_getErrorName(actualDecompressedSize)));
-    }
-
-    if (actualDecompressedSize != decompressedSize) {
-      if (actualDecompressedSize < newFileBuffer.size()) {
-        newFileBuffer.resize(actualDecompressedSize);
-      }
-    }
-
-    QNN_INFO("Decompressed %zu bytes into new file buffer.",
-             actualDecompressedSize);
-
-    writeFileForPatch(newFilePath, newFileBuffer);
-    QNN_INFO("Successfully applied patch. New file saved to: %s",
-             newFilePath.c_str());
-
-  } catch (const std::exception &e) {
-    QNN_ERROR("Error applying patch: %s", e.what());
-    return 1;
-  }
-  return 0;
-}
-
 std::unique_ptr<PatchedModelBuffer> applyZstdPatchToBuffer(
     const std::string &oldFilePath, const std::string &patchFilePath) {
   try {
-    std::vector<char> oldFileBuffer = readFileForPatch(oldFilePath);
-    QNN_INFO("Read old file (%s): %zu bytes.", oldFilePath.c_str(),
-             oldFileBuffer.size());
+    // The old model is only read (as the zstd dictionary), so map it read-only
+    // instead of pulling the whole multi-GB file into an anonymous buffer.
+    MmapFile oldFile(oldFilePath);
+    if (!oldFile.valid()) {
+      throw std::runtime_error("Failed to map old file: " + oldFilePath);
+    }
+    QNN_INFO("Mapped old file (%s): %zu bytes.", oldFilePath.c_str(),
+             oldFile.size);
 
     std::vector<char> patchFileBuffer = readFileForPatch(patchFilePath);
     QNN_INFO("Read patch file (%s): %zu bytes.", patchFilePath.c_str(),
@@ -365,7 +492,7 @@ std::unique_ptr<PatchedModelBuffer> applyZstdPatchToBuffer(
 
     size_t const actualDecompressedSize = ZSTD_decompress_usingDict(
         dctx, newBuffer, decompressedSize, patchFileBuffer.data(),
-        patchFileBuffer.size(), oldFileBuffer.data(), oldFileBuffer.size());
+        patchFileBuffer.size(), oldFile.data, oldFile.size);
 
     ZSTD_freeDCtx(dctx);
 
@@ -467,11 +594,13 @@ void processCommandLine(int argc, char **argv) {
     OPT_SYSTEM_LIBRARY = 14,
     OPT_PORT = 15,
     OPT_TOKENIZER = 16,
-    OPT_PATCH = 17
+    OPT_PATCH = 17,
+    OPT_LISTEN_ALL = 18
   };
   static struct pal::Option s_longOptions[] = {
       {"help", pal::no_argument, NULL, OPT_HELP},
       {"port", pal::required_argument, NULL, OPT_PORT},
+      {"listen_all", pal::no_argument, NULL, OPT_LISTEN_ALL},
       {"text_embedding_size", pal::required_argument, NULL,
        OPT_TEXT_EMBEDDING_SIZE},
       {"cpu", pal::no_argument, NULL, OPT_USE_MNN},
@@ -560,6 +689,9 @@ void processCommandLine(int argc, char **argv) {
       case OPT_PORT:
         port = std::stoi(pal::g_optArg);
         break;
+      case OPT_LISTEN_ALL:
+        listen_address = "0.0.0.0";
+        break;
       case OPT_TOKENIZER:
         tokenizerPath = pal::g_optArg;
         break;
@@ -644,7 +776,7 @@ void processCommandLine(int argc, char **argv) {
   // Post-CLI: load CLIP extras (pos_emb/token_emb) and auto-detect clip_v2 /
   // clip2 based on flags.
   auto loadTokenEmb = [](const std::filesystem::path &tokenEmbPath,
-                         std::vector<uint16_t> &dst, bool force_fp16) {
+                         TokenEmbTable &dst, bool force_fp16) {
     std::ifstream tokenFile(tokenEmbPath, std::ios::binary);
     tokenFile.seekg(0, std::ios::end);
     size_t fileSize = tokenFile.tellg();
@@ -652,23 +784,46 @@ void processCommandLine(int argc, char **argv) {
 
     const size_t SIZE_THRESHOLD = 100 * 1024 * 1024;  // 100MB
     if (!force_fp16 && fileSize > SIZE_THRESHOLD) {
+      // FP32 on disk: narrow to FP16 in an owned buffer (cannot be mapped as
+      // uint16 directly). This branch is the legacy SD1.5 large-table path.
       size_t tokenSize = fileSize / sizeof(float);
       std::vector<float> tempBuffer(tokenSize);
       tokenFile.read(reinterpret_cast<char *>(tempBuffer.data()), fileSize);
-      dst.resize(tokenSize);
+      std::vector<uint16_t> converted(tokenSize);
       for (size_t i = 0; i < tokenSize; i++) {
-        dst[i] = fp32_to_fp16(tempBuffer[i]);
+        converted[i] = fp32_to_fp16(tempBuffer[i]);
       }
+      dst.setOwned(std::move(converted));
       QNN_INFO("Loaded %s: %zu floats (converted FP32->FP16)",
                tokenEmbPath.filename().string().c_str(), tokenSize);
-    } else {
-      size_t tokenSize = fileSize / sizeof(uint16_t);
-      dst.resize(tokenSize);
-      tokenFile.read(reinterpret_cast<char *>(dst.data()), fileSize);
-      QNN_INFO("Loaded %s: %zu elements (FP16)",
-               tokenEmbPath.filename().string().c_str(), tokenSize);
+      return;
     }
+
+    // FP16 on disk: map read-only and look up lazily. Token lookups are
+    // sparse, so MADV_RANDOM avoids pointless readahead of untouched rows.
     tokenFile.close();
+    size_t tokenSize = fileSize / sizeof(uint16_t);
+    int fd = open(tokenEmbPath.c_str(), O_RDONLY);
+    void *mapped = MAP_FAILED;
+    if (fd >= 0) {
+      mapped = mmap(nullptr, fileSize, PROT_READ, MAP_PRIVATE, fd, 0);
+      close(fd);
+    }
+    if (mapped != MAP_FAILED) {
+      madvise(mapped, fileSize, MADV_RANDOM);
+      dst.setMapped(mapped, fileSize);
+      QNN_INFO("Mapped %s: %zu elements (FP16, mmap)",
+               tokenEmbPath.filename().string().c_str(), tokenSize);
+      return;
+    }
+
+    // Fallback: read into an owned buffer if the mapping failed.
+    std::ifstream fallback(tokenEmbPath, std::ios::binary);
+    std::vector<uint16_t> owned(tokenSize);
+    fallback.read(reinterpret_cast<char *>(owned.data()), fileSize);
+    dst.setOwned(std::move(owned));
+    QNN_INFO("Loaded %s: %zu elements (FP16)",
+             tokenEmbPath.filename().string().c_str(), tokenSize);
   };
 
   auto loadPosEmb = [](const std::filesystem::path &posEmbPath,
@@ -743,24 +898,24 @@ void processCommandLine(int argc, char **argv) {
 
   if (use_safety_checker) {
     safetyCheckerInterpreter =
-        MNN::Interpreter::createFromFile(safetyCheckerPath.c_str());
+        createMnnInterpreterMmap(safetyCheckerPath.c_str());
     if (!safetyCheckerInterpreter)
       showHelpAndExit("Failed load Safety MNN: " + safetyCheckerPath);
   }
 
   if (use_mnn_clip) {
-    clipInterpreter = MNN::Interpreter::createFromFile(clipPath.c_str());
+    clipInterpreter = createMnnInterpreterMmap(clipPath.c_str());
     if (!clipInterpreter) showHelpAndExit("Failed load CLIP MNN: " + clipPath);
   }
 
   if (sdxl_mode && !lowram_mode) {
     // SDXL text encoders always run on MNN (CPU) regardless of backend.
     if (!clipInterpreter) {
-      clipInterpreter = MNN::Interpreter::createFromFile(clipPath.c_str());
+      clipInterpreter = createMnnInterpreterMmap(clipPath.c_str());
       if (!clipInterpreter)
         showHelpAndExit("Failed load SDXL CLIP1 MNN: " + clipPath);
     }
-    clip2Interpreter = MNN::Interpreter::createFromFile(clip2Path.c_str());
+    clip2Interpreter = createMnnInterpreterMmap(clip2Path.c_str());
     if (!clip2Interpreter)
       showHelpAndExit("Failed load SDXL CLIP2 MNN: " + clip2Path);
   }
@@ -871,12 +1026,12 @@ struct ScopeExit {
 // --- SDXL low-RAM lazy load/release helpers ---
 static void loadSdxlClipMnnIfNeeded() {
   if (!clipInterpreter) {
-    clipInterpreter = MNN::Interpreter::createFromFile(clipPath.c_str());
+    clipInterpreter = createMnnInterpreterMmap(clipPath.c_str());
     if (!clipInterpreter)
       throw std::runtime_error("[lowram] Failed load SDXL CLIP1 MNN");
   }
   if (!clip2Interpreter) {
-    clip2Interpreter = MNN::Interpreter::createFromFile(clip2Path.c_str());
+    clip2Interpreter = createMnnInterpreterMmap(clip2Path.c_str());
     if (!clip2Interpreter)
       throw std::runtime_error("[lowram] Failed load SDXL CLIP2 MNN");
   }
@@ -1559,7 +1714,7 @@ xt::xarray<uint8_t> upscaleImageWithMNN(const std::vector<uint8_t> &input_image,
   const float scale_factor = 4.0f;
 
   auto interpreter = std::shared_ptr<MNN::Interpreter>(
-      MNN::Interpreter::createFromFile(model_path.c_str()));
+      createMnnInterpreterMmap(model_path.c_str()));
   if (!interpreter) {
     throw std::runtime_error("Failed to create MNN interpreter from: " +
                              model_path);
@@ -1568,7 +1723,14 @@ xt::xarray<uint8_t> upscaleImageWithMNN(const std::vector<uint8_t> &input_image,
   MNN::ScheduleConfig config;
   MNN::BackendConfig backendConfig;
   if (use_opencl) {
-    auto cache_file = model_path + ".mnnc";
+    auto cache_dir = ensureCacheDir(
+        std::filesystem::path(model_path).parent_path().string());
+    auto cache_file =
+        (cache_dir.empty()
+             ? model_path
+             : cache_dir + "/" +
+                   std::filesystem::path(model_path).filename().string()) +
+        ".mnnc";
     interpreter->setCacheFile(cache_file.c_str());
     config.type = MNN_FORWARD_OPENCL;
     config.mode = MNN_GPU_MEMORY_BUFFER | MNN_GPU_TUNING_FAST;
@@ -1782,37 +1944,48 @@ GenerationResult generateImage(
 
     auto clip_start = std::chrono::high_resolution_clock::now();
 
-    // Try to reuse the previous CLIP outputs when the prompt pair is
-    // unchanged. This also skips lowram CLIP (de)allocation in SDXL.
-    const size_t sd_embed_size = (size_t)batch_size * 77 * text_embedding_size;
-    const size_t sdxl_hidden_size = (size_t)batch_size * 77 * sdxl_concat_dim;
-    const size_t sdxl_pooled_size = (size_t)batch_size * text_embedding_size_2;
+    // Persistent per-prompt CLIP cache. Positive and negative are looked up
+    // independently — a one-sided hit still saves half the CLIP work. A side
+    // whose prompt resolves any TI embedding token is excluded from disk
+    // caching: the CLIP output then depends on currently-loaded embedding
+    // data we don't want frozen into a stable file.
+    std::string prompt_cache_dir = ensureCacheDir(modelDir);
+    bool neg_has_emb = promptHasEmbedding(negative_prompt);
+    bool pos_has_emb = promptHasEmbedding(prompt);
+    bool neg_cache_eligible = !prompt_cache_dir.empty() && !neg_has_emb;
+    bool pos_cache_eligible = !prompt_cache_dir.empty() && !pos_has_emb;
 
-    bool clip_cache_hit = false;
-    if (clip_cache_valid && cached_prompt == prompt &&
-        cached_negative_prompt == negative_prompt) {
-      if (sdxl_mode) {
-        if (cached_sdxl_encoder_hidden_states.size() == sdxl_hidden_size &&
-            cached_sdxl_text_embeds.size() == sdxl_pooled_size) {
-          memcpy(sdxl_encoder_hidden_states.data(),
-                 cached_sdxl_encoder_hidden_states.data(),
-                 sdxl_hidden_size * sizeof(float));
-          memcpy(sdxl_text_embeds.data(), cached_sdxl_text_embeds.data(),
-                 sdxl_pooled_size * sizeof(float));
-          clip_cache_hit = true;
-        }
-      } else {
-        if (cached_text_embedding_float.size() == sd_embed_size) {
-          memcpy(text_embedding_float.data(),
-                 cached_text_embedding_float.data(),
-                 sd_embed_size * sizeof(float));
-          clip_cache_hit = true;
-        }
-      }
-    }
+    const uint32_t cache_mode =
+        sdxl_mode ? prompt_cache::kModeSdxl : prompt_cache::kModeSd15;
+    const uint32_t cache_hidden_dim =
+        sdxl_mode ? (uint32_t)sdxl_concat_dim : (uint32_t)text_embedding_size;
+    const uint32_t cache_pooled_dim =
+        sdxl_mode ? (uint32_t)text_embedding_size_2 : 0u;
 
-    if (clip_cache_hit) {
-      QNN_INFO("CLIP cache hit, reusing cached text embeddings");
+    float *neg_hidden_dst = sdxl_mode ? sdxl_encoder_hidden_states.data()
+                                      : text_embedding_float.data();
+    float *pos_hidden_dst =
+        sdxl_mode ? sdxl_encoder_hidden_states.data() + 77 * sdxl_concat_dim
+                  : text_embedding_float.data() + 77 * text_embedding_size;
+    float *neg_pooled_dst = sdxl_mode ? sdxl_text_embeds.data() : nullptr;
+    float *pos_pooled_dst =
+        sdxl_mode ? sdxl_text_embeds.data() + text_embedding_size_2 : nullptr;
+
+    bool neg_hit =
+        neg_cache_eligible &&
+        loadPromptCache(prompt_cache_dir, negative_prompt, cache_mode,
+                        cache_hidden_dim, cache_pooled_dim, neg_hidden_dst,
+                        neg_pooled_dst);
+    bool pos_hit =
+        pos_cache_eligible &&
+        loadPromptCache(prompt_cache_dir, prompt, cache_mode, cache_hidden_dim,
+                        cache_pooled_dim, pos_hidden_dst, pos_pooled_dst);
+
+    if (neg_hit) QNN_INFO("Prompt cache hit (negative)");
+    if (pos_hit) QNN_INFO("Prompt cache hit (positive)");
+
+    if (neg_hit && pos_hit) {
+      QNN_INFO("CLIP cache hit (both sides), skipping CLIP inference");
     } else {
       ProcessedPromptPair processed =
           processPromptPair(prompt, negative_prompt, 77);
@@ -1881,17 +2054,19 @@ GenerationResult generateImage(
                  text_embedding_size_2 * sizeof(float));
         };
 
-        // negative (batch idx 0)
-        run_sdxl_clip(processed.negative_embeddings,
-                      processed.negative_embeddings_2, processed.ids.data(),
-                      sdxl_encoder_hidden_states.data(),
-                      sdxl_text_embeds.data());
-        // positive (batch idx 1)
-        run_sdxl_clip(processed.positive_embeddings,
-                      processed.positive_embeddings_2,
-                      processed.ids.data() + 77,
-                      sdxl_encoder_hidden_states.data() + 77 * sdxl_concat_dim,
-                      sdxl_text_embeds.data() + text_embedding_size_2);
+        if (!neg_hit) {
+          run_sdxl_clip(processed.negative_embeddings,
+                        processed.negative_embeddings_2, processed.ids.data(),
+                        sdxl_encoder_hidden_states.data(),
+                        sdxl_text_embeds.data());
+        }
+        if (!pos_hit) {
+          run_sdxl_clip(
+              processed.positive_embeddings, processed.positive_embeddings_2,
+              processed.ids.data() + 77,
+              sdxl_encoder_hidden_states.data() + 77 * sdxl_concat_dim,
+              sdxl_text_embeds.data() + text_embedding_size_2);
+        }
         if (sdxl_lowram) releaseSdxlClipMnn();
       } else if (use_mnn || use_mnn_clip) {
         MNN::Interpreter *currentClipInterpreter = nullptr;
@@ -1905,8 +2080,7 @@ GenerationResult generateImage(
             throw std::runtime_error(
                 "Global clipInterpreter (hybrid) not initialized!");
         } else {
-          currentClipInterpreter =
-              MNN::Interpreter::createFromFile(clipPath.c_str());
+          currentClipInterpreter = createMnnInterpreterMmap(clipPath.c_str());
           if (!currentClipInterpreter)
             throw std::runtime_error(
                 "Failed to create temporary MNN CLIP interpreter!");
@@ -1937,21 +2111,25 @@ GenerationResult generateImage(
 
           if (dynamicCreated) currentClipInterpreter->releaseModel();
 
-          memcpy(input->host<float>(), processed.negative_embeddings.data(),
-                 77 * 768 * sizeof(float));
-          currentClipInterpreter->runSession(currentClipSession);
-          auto out = currentClipInterpreter->getSessionOutput(
-              currentClipSession, "last_hidden_state");
-          memcpy(embed_ptr, out->host<float>(),
-                 77 * text_embedding_size * sizeof(float));
+          if (!neg_hit) {
+            memcpy(input->host<float>(), processed.negative_embeddings.data(),
+                   77 * 768 * sizeof(float));
+            currentClipInterpreter->runSession(currentClipSession);
+            auto out = currentClipInterpreter->getSessionOutput(
+                currentClipSession, "last_hidden_state");
+            memcpy(embed_ptr, out->host<float>(),
+                   77 * text_embedding_size * sizeof(float));
+          }
 
-          memcpy(input->host<float>(), processed.positive_embeddings.data(),
-                 77 * 768 * sizeof(float));
-          currentClipInterpreter->runSession(currentClipSession);
-          out = currentClipInterpreter->getSessionOutput(currentClipSession,
-                                                         "last_hidden_state");
-          memcpy(embed_ptr + 77 * text_embedding_size, out->host<float>(),
-                 77 * text_embedding_size * sizeof(float));
+          if (!pos_hit) {
+            memcpy(input->host<float>(), processed.positive_embeddings.data(),
+                   77 * 768 * sizeof(float));
+            currentClipInterpreter->runSession(currentClipSession);
+            auto out = currentClipInterpreter->getSessionOutput(
+                currentClipSession, "last_hidden_state");
+            memcpy(embed_ptr + 77 * text_embedding_size, out->host<float>(),
+                   77 * text_embedding_size * sizeof(float));
+          }
 
           if (sessionCreated)
             currentClipInterpreter->releaseSession(currentClipSession);
@@ -1965,19 +2143,24 @@ GenerationResult generateImage(
 
           if (dynamicCreated) currentClipInterpreter->releaseModel();
 
-          memcpy(input->host<int>(), input_ids_ptr, 77 * sizeof(int32_t));
-          currentClipInterpreter->runSession(currentClipSession);
-          auto out = currentClipInterpreter->getSessionOutput(
-              currentClipSession, "last_hidden_state");
-          memcpy(embed_ptr, out->host<float>(),
-                 77 * text_embedding_size * sizeof(float));
+          if (!neg_hit) {
+            memcpy(input->host<int>(), input_ids_ptr, 77 * sizeof(int32_t));
+            currentClipInterpreter->runSession(currentClipSession);
+            auto out = currentClipInterpreter->getSessionOutput(
+                currentClipSession, "last_hidden_state");
+            memcpy(embed_ptr, out->host<float>(),
+                   77 * text_embedding_size * sizeof(float));
+          }
 
-          memcpy(input->host<int>(), input_ids_ptr + 77, 77 * sizeof(int32_t));
-          currentClipInterpreter->runSession(currentClipSession);
-          out = currentClipInterpreter->getSessionOutput(currentClipSession,
-                                                         "last_hidden_state");
-          memcpy(embed_ptr + 77 * text_embedding_size, out->host<float>(),
-                 77 * text_embedding_size * sizeof(float));
+          if (!pos_hit) {
+            memcpy(input->host<int>(), input_ids_ptr + 77,
+                   77 * sizeof(int32_t));
+            currentClipInterpreter->runSession(currentClipSession);
+            auto out = currentClipInterpreter->getSessionOutput(
+                currentClipSession, "last_hidden_state");
+            memcpy(embed_ptr + 77 * text_embedding_size, out->host<float>(),
+                   77 * text_embedding_size * sizeof(float));
+          }
 
           if (sessionCreated)
             currentClipInterpreter->releaseSession(currentClipSession);
@@ -1986,32 +2169,30 @@ GenerationResult generateImage(
       } else {
         if (!clipApp)
           throw std::runtime_error("Global clipApp not initialized!");
-        if (StatusCode::SUCCESS !=
-            clipApp->executeClipGraphs(input_ids_ptr, embed_ptr))
-          throw std::runtime_error("QNN CLIP exec failed (neg)");
-        if (StatusCode::SUCCESS !=
-            clipApp->executeClipGraphs(input_ids_ptr + 77,
-                                       embed_ptr + 77 * text_embedding_size))
-          throw std::runtime_error("QNN CLIP exec failed (pos)");
+        if (!neg_hit) {
+          if (StatusCode::SUCCESS !=
+              clipApp->executeClipGraphs(input_ids_ptr, embed_ptr))
+            throw std::runtime_error("QNN CLIP exec failed (neg)");
+        }
+        if (!pos_hit) {
+          if (StatusCode::SUCCESS !=
+              clipApp->executeClipGraphs(input_ids_ptr + 77,
+                                         embed_ptr + 77 * text_embedding_size))
+            throw std::runtime_error("QNN CLIP exec failed (pos)");
+        }
       }
 
-      // Persist CLIP outputs so the next request with identical prompts can
-      // bypass the text encoder entirely.
-      cached_prompt = prompt;
-      cached_negative_prompt = negative_prompt;
-      if (sdxl_mode) {
-        cached_sdxl_encoder_hidden_states = sdxl_encoder_hidden_states;
-        cached_sdxl_text_embeds = sdxl_text_embeds;
-        cached_text_embedding_float.clear();
-        cached_text_embedding_float.shrink_to_fit();
-      } else {
-        cached_text_embedding_float = text_embedding_float;
-        cached_sdxl_encoder_hidden_states.clear();
-        cached_sdxl_encoder_hidden_states.shrink_to_fit();
-        cached_sdxl_text_embeds.clear();
-        cached_sdxl_text_embeds.shrink_to_fit();
+      // Persist freshly-computed CLIP outputs (per side). Sides that used a
+      // TI embedding stay out of disk cache.
+      if (!neg_hit && neg_cache_eligible) {
+        savePromptCache(prompt_cache_dir, negative_prompt, cache_mode,
+                        cache_hidden_dim, cache_pooled_dim, neg_hidden_dst,
+                        neg_pooled_dst);
       }
-      clip_cache_valid = true;
+      if (!pos_hit && pos_cache_eligible) {
+        savePromptCache(prompt_cache_dir, prompt, cache_mode, cache_hidden_dim,
+                        cache_pooled_dim, pos_hidden_dst, pos_pooled_dst);
+      }
     }
 
     auto clip_end = std::chrono::high_resolution_clock::now();
@@ -2025,17 +2206,18 @@ GenerationResult generateImage(
 
     // --- Scheduler & Latents ---
     std::unique_ptr<Scheduler> scheduler;
+    const char *timestep_spacing = sdxl_mode ? "trailing" : "leading";
     if (scheduler_type == "euler_a" || scheduler_type == "eulera" ||
         scheduler_type == "euler_a_karras") {
       bool use_karras = (scheduler_type == "euler_a_karras");
       scheduler = std::make_unique<EulerAncestralDiscreteScheduler>(
-          1000, 0.00085f, 0.012f, "scaled_linear", "epsilon", "leading", 0,
-          false, use_karras);
+          1000, 0.00085f, 0.012f, "scaled_linear", "epsilon", timestep_spacing,
+          0, false, use_karras);
     } else if (scheduler_type == "euler" || scheduler_type == "euler_karras") {
       bool use_karras = (scheduler_type == "euler_karras");
       scheduler = std::make_unique<EulerDiscreteScheduler>(
-          1000, 0.00085f, 0.012f, "scaled_linear", "epsilon", "leading", 0,
-          false, use_karras);
+          1000, 0.00085f, 0.012f, "scaled_linear", "epsilon", timestep_spacing,
+          0, false, use_karras);
     } else if (scheduler_type == "lcm") {
       scheduler = std::make_unique<LCMScheduler>(1000, 0.00085f, 0.012f,
                                                  "scaled_linear", "epsilon", 50,
@@ -2044,14 +2226,14 @@ GenerationResult generateImage(
                scheduler_type == "dpm_sde_karras") {
       bool use_karras = (scheduler_type == "dpm_sde_karras");
       scheduler = std::make_unique<DPMSolverMultistepScheduler>(
-          1000, 0.00085f, 0.012f, "scaled_linear", 2, "epsilon", "leading",
-          use_karras, "sde-dpmsolver++");
+          1000, 0.00085f, 0.012f, "scaled_linear", 2, "epsilon",
+          timestep_spacing, use_karras, "sde-dpmsolver++");
     } else {
       // Default to DPM solver; "dpm_karras" enables Karras sigma schedule.
       bool use_karras = (scheduler_type == "dpm_karras");
       scheduler = std::make_unique<DPMSolverMultistepScheduler>(
-          1000, 0.00085f, 0.012f, "scaled_linear", 2, "epsilon", "leading",
-          use_karras);
+          1000, 0.00085f, 0.012f, "scaled_linear", 2, "epsilon",
+          timestep_spacing, use_karras);
     }
     if (use_v_pred) scheduler->set_prediction_type("v_prediction");
     scheduler->set_timesteps(steps);
@@ -2097,9 +2279,13 @@ GenerationResult generateImage(
         bool loaded_from_cache = false;
         if (aspect_pad_inpaint && aspect_pad_synthetic_base &&
             !modelDir.empty()) {
-          black_latent_cache_path = modelDir + "/aspect_latent_" +
-                                    std::to_string(target_crop_width) + "x" +
-                                    std::to_string(target_crop_height) + ".bin";
+          auto cache_dir = ensureCacheDir(modelDir);
+          if (!cache_dir.empty()) {
+            black_latent_cache_path = cache_dir + "/aspect_latent_" +
+                                      std::to_string(target_crop_width) + "x" +
+                                      std::to_string(target_crop_height) +
+                                      ".bin";
+          }
           std::ifstream ifs(black_latent_cache_path, std::ios::binary);
           if (ifs) {
             ifs.seekg(0, std::ios::end);
@@ -2124,14 +2310,16 @@ GenerationResult generateImage(
         if (!loaded_from_cache) {
           if (use_mnn) {
             MNN::Interpreter *currentVaeEncoderInterpreter =
-                MNN::Interpreter::createFromFile(vaeEncoderPath.c_str());
+                createMnnInterpreterMmap(vaeEncoderPath.c_str());
             if (!currentVaeEncoderInterpreter)
               throw std::runtime_error("Failed MNN VAE Enc create");
 
             MNN::ScheduleConfig cfg_vae_enc;
             MNN::BackendConfig bkCfg_vae_enc;
             if (use_opencl) {
-              auto cache_file = modelDir + "/vae_enc_cache.mnnc." +
+              auto cache_dir = ensureCacheDir(modelDir);
+              auto cache_file = (cache_dir.empty() ? modelDir : cache_dir) +
+                                "/vae_enc_cache.mnnc." +
                                 std::to_string(output_width);
               currentVaeEncoderInterpreter->setCacheFile(cache_file.c_str());
               cfg_vae_enc.type = MNN_FORWARD_OPENCL;
@@ -2364,8 +2552,7 @@ GenerationResult generateImage(
     MNN::Session *currentUnetSession = nullptr;
 
     if (use_mnn) {
-      currentUnetInterpreter =
-          MNN::Interpreter::createFromFile(unetPath.c_str());
+      currentUnetInterpreter = createMnnInterpreterMmap(unetPath.c_str());
       if (!currentUnetInterpreter)
         throw std::runtime_error(
             "Failed to create temporary MNN UNET interpreter!");
@@ -2373,8 +2560,9 @@ GenerationResult generateImage(
       MNN::ScheduleConfig cfg_unet;
       MNN::BackendConfig bkCfg_unet;
       if (use_opencl) {
-        auto cache_file =
-            modelDir + "/unet_cache.mnnc." + std::to_string(output_width);
+        auto cache_dir = ensureCacheDir(modelDir);
+        auto cache_file = (cache_dir.empty() ? modelDir : cache_dir) +
+                          "/unet_cache.mnnc." + std::to_string(output_width);
         currentUnetInterpreter->setCacheFile(cache_file.c_str());
         cfg_unet.type = MNN_FORWARD_OPENCL;
         cfg_unet.mode = MNN_GPU_MEMORY_BUFFER | MNN_GPU_TUNING_FAST;
@@ -2717,7 +2905,7 @@ GenerationResult generateImage(
 
       if (use_mnn) {
         MNN::Interpreter *currentVaeDecoderInterpreter =
-            MNN::Interpreter::createFromFile(vaeDecoderPath.c_str());
+            createMnnInterpreterMmap(vaeDecoderPath.c_str());
 
         if (!currentVaeDecoderInterpreter)
           throw std::runtime_error(
@@ -2726,8 +2914,10 @@ GenerationResult generateImage(
         MNN::ScheduleConfig cfg_vae;
         MNN::BackendConfig bkCfg_vae;
         if (use_opencl) {
-          auto cache_file =
-              modelDir + "/vae_dec_cache.mnnc." + std::to_string(output_width);
+          auto cache_dir = ensureCacheDir(modelDir);
+          auto cache_file = (cache_dir.empty() ? modelDir : cache_dir) +
+                            "/vae_dec_cache.mnnc." +
+                            std::to_string(output_width);
           currentVaeDecoderInterpreter->setCacheFile(cache_file.c_str());
           cfg_vae.type = MNN_FORWARD_OPENCL;
           cfg_vae.mode = MNN_GPU_MEMORY_BUFFER | MNN_GPU_TUNING_FAST;
@@ -3131,6 +3321,15 @@ int main(int argc, char **argv) {
 
   // --- HTTP Server ---
   httplib::Server svr;
+  svr.set_default_headers({
+      {"Access-Control-Allow-Origin", "*"},
+      {"Access-Control-Allow-Methods", "GET, POST, OPTIONS"},
+      {"Access-Control-Allow-Headers", "Content-Type, Authorization"},
+      {"Access-Control-Max-Age", "86400"},
+  });
+  svr.Options(R"(.*)", [](const httplib::Request &, httplib::Response &res) {
+    res.status = 204;
+  });
   svr.Get("/health", [](const httplib::Request &, httplib::Response &res) {
     res.status = 200;
   });
@@ -3397,7 +3596,6 @@ int main(int argc, char **argv) {
       res.set_header("Content-Type", "text/event-stream");
       res.set_header("Cache-Control", "no-cache");
       res.set_header("Connection", "keep-alive");
-      res.set_header("Access-Control-Allow-Origin", "*");
       res.set_chunked_content_provider(
           "text/event-stream", [&](intptr_t, httplib::DataSink &sink) -> bool {
             try {
@@ -3459,7 +3657,6 @@ int main(int argc, char **argv) {
             {"type", "request_error"}}}};
       res.status = 400;
       res.set_content(err.dump(), "application/json");
-      res.set_header("Access-Control-Allow-Origin", "*");
     } catch (const std::invalid_argument &e) {
       nlohmann::json err = {
           {"error",
@@ -3467,7 +3664,6 @@ int main(int argc, char **argv) {
             {"type", "request_error"}}}};
       res.status = 400;
       res.set_content(err.dump(), "application/json");
-      res.set_header("Access-Control-Allow-Origin", "*");
     } catch (const std::exception &e) {
       nlohmann::json err = {
           {"error",
@@ -3475,7 +3671,6 @@ int main(int argc, char **argv) {
             {"type", "server_error"}}}};
       res.status = 500;
       res.set_content(err.dump(), "application/json");
-      res.set_header("Access-Control-Allow-Origin", "*");
     }
   });
   svr.Post("/about", [](const httplib::Request &, httplib::Response &res) {
@@ -3621,7 +3816,6 @@ int main(int argc, char **argv) {
       res.set_header("X-Output-Width", std::to_string(final_width));
       res.set_header("X-Output-Height", std::to_string(final_height));
       res.set_header("X-Duration-Ms", std::to_string(duration));
-      res.set_header("Access-Control-Allow-Origin", "*");
       res.set_header("Access-Control-Expose-Headers",
                      "X-Output-Width,X-Output-Height,X-Duration-Ms");
 
@@ -3639,7 +3833,6 @@ int main(int argc, char **argv) {
             {"type", "request_error"}}}};
       res.status = 400;
       res.set_content(err.dump(), "application/json");
-      res.set_header("Access-Control-Allow-Origin", "*");
     } catch (const std::exception &e) {
       tempUpscalerApp.reset();
       nlohmann::json err = {
@@ -3648,13 +3841,11 @@ int main(int argc, char **argv) {
             {"type", "server_error"}}}};
       res.status = 500;
       res.set_content(err.dump(), "application/json");
-      res.set_header("Access-Control-Allow-Origin", "*");
     }
   });
 
   svr.Post("/tokenize", [&](const httplib::Request &req,
                             httplib::Response &res) {
-    res.set_header("Access-Control-Allow-Origin", "*");
     try {
       auto json = nlohmann::json::parse(req.body);
       std::string text = json.value("prompt", std::string());
